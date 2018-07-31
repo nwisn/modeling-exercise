@@ -60,20 +60,27 @@ To use the models build in this analysis for prediction on future data:
 2. load the new data file
 3. use the saved model to apply the same preprocessing to the new data
 4. use the saved model to make predictions from the preprocessed new data
+5. compute error statistics
 
 ```{r, eval = F}
 # load stored model objects
 load("final_models.RData")
 
 # read in new data
-newdatafile <- "mynewdata.csv" 
+newdatafile <- "mynewdata.csv" # whatever you got
 newdata <- read.csv(newdatafile)
 
 # apply same pre-processing to features
 testing <- predict(full$preProcess.model, newdata) 
 
-# make predictions
-predictions <- predict(finalmodel.cv$gbm$model, testing)
+# get all model predctions
+predictions <- sapply(finalmodel.cv, 
+                      function(this) predict(this$model, testing))
+
+# estimate error stats
+require(caret)
+performance <- apply(predictions, 2, 
+                     function(pred) postResample(pred, newdata$Dependent_Feature))
 ```
 
 
