@@ -1,0 +1,475 @@
+---
+title: "Predictive modeling exercise"
+author: "Nicholas Wisniewski"
+date: July 31, 2018
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    collapsed: true
+    number_sections: true
+    theme: cosmo
+    highlight: zenburn
+    df_print: kable
+    code_folding: show
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, eval = F, echo = F}
+# the analysis is run through these files
+source("data_partitions.R")
+source("clean_data.R")
+source("pca_cor_clust.R")
+source("test_cv_model.R")
+source("fit_final_model.R")
+```
+
+# Introduction
+
+Our task in this modeling exercise was to develop a predictive model for a high-dimensional dataset where the number of samples is approximately equal to the number of predictors, $n\sim p$. We were particularly interested in variable selection, model creation, and assessing overall confidence in the model given several constraints hidden in the data. 
+
+Our analysis was organized into 4 main parts:
+
+1. __Data cleaning__: In the first part, we cleaned the data. 
+2. __Overview__: In the second, we got an overview using PCA and clustering.
+3. __Evaluation__: In the third, we wanted to evaluate the performance of several models, and investigate bias and variance in the predictions. We split the data into 80% training and 20% testing sets, and fit an array of predictive models on the training set using 10-fold 2x-repeated cross-validation to tune the hyperparameters. We then evaluated their prediction errors on the testing set, and compared them to the estimates obtained from cross-validation. 
+4. __Final models__: In the fourth, we wanted to build the final models from the entire dataset, to be applied to some future data. We used 10-fold 2x-repeated cross-validation to estimate the RMSE.
+
+```{r, echo=F}
+rm(list = setdiff(ls(), lsf.str()))
+load("final_models.RData")
+temp <- summary(rValues)
+```
+
+We determined that the models are underfitting, and could benefit from more data. This appeared as bias in the predicted values, caused by shrinkage of the coefficients due to regularization, such that low values are over-estimated and high values are under-estimated. By increasing the size of the dataset, the models may be able to take on more complexity under cross-validation.
+
+For the set of models we evaluated, we estimated that `r rownames(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),])[1]` is the best model, with an estimated `r paste0("RMSE = ", signif(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),][1,4], 3), " (IQR: ",  signif(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),][1,2], 3), " - ", signif(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),][1,5], 3), ")" )`. The worst model was `r rownames(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),])[nrow(temp$statistics$RMSE)]`, with an estimated `r paste0("RMSE = ", signif(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),][nrow(temp$statistics$RMSE),4], 3), " (IQR: ",  signif(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),][nrow(temp$statistics$RMSE),2], 3), " - ", signif(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),][nrow(temp$statistics$RMSE),5], 3), ")" )`. The remaining methods look approximately equivalent in error, but there were large differences in computational cost. If speed is an important consideration, partial least squares (`pls`) and principal component regression (`pcr`) performed quite well and are blazing fast. If built-in feature selection is also an important consideration, then `pls` stands alone in its ability to calculate interpretable and accurate results very quickly. More details concerning these models will follow.
+
+
+## How to apply the predictive model in R
+
+To use the models build in this analysis for prediction on future data:
+
+1. load the Rdata file 
+2. load the new data file
+3. use the saved model to apply the same preprocessing to the new data
+4. use the saved model to make predictions from the preprocessed new data
+
+```{r, eval = F}
+# load stored model objects
+load("final_models.RData")
+
+# read in new data
+newdatafile <- "mynewdata.csv" 
+newdata <- read.csv(newdatafile)
+
+# apply same pre-processing to features
+testing <- predict(full$preProcess.model, newdata) 
+
+# make predictions
+predictions <- predict(finalmodel.cv$gbm$model, testing)
+```
+
+
+
+# Data Cleaning
+
+## Table
+
+```{r, echo =F, message = F}
+require(kableExtra)
+raw <- read.csv("Table_of_features.csv")
+kable(raw,
+      digits = 3,
+      row.names = T,
+      caption = "Table - Raw data"
+) %>%
+    kable_styling(bootstrap_options = c("striped", 
+                                        "hover", 
+                                        "condensed",
+                                        "responsive"),
+                  font_size = 12) %>%
+    scroll_box(width = "100%", height = "300px") 
+```
+
+
+
+## Issues
+
+__Degeneracy__. We noticed that some features were degenerate -- their correlations with each other were equal to 1 (see *Figure - Degeneracies*). We removed these before doing anything else, because their presence would affect any distance measures and imputations that come next. In order to identify degenerate features, we treated correlations between features as edges of a graph where the features are nodes, and identified *strongly connected components* -- subgraphs where every node in a group shares an edge with every other node in the group. We then sampled one feature from each component, discarding the rest to resolve the degeneracy.
+
+__Missing data__. There were 6 features where approximately 2/3 of the data was missing, and another 3 that were missing only one value. We removed features missing 2/3 data from the analysis completely, and imputed missing values for the remaining samples by averaging their 5 nearest neighbors. 
+
+__Non-normality__. We noticed many of the features had non-Gaussian distributions, confirmed using the Shapiro-Wilk test. We used a power transformation (Yeo-Johnson) to monotonically transform features to make them more normal. We also centered and scaled each feature to get them on equal footing. 
+
+__Outliers__. We looked for outliers by computing the leverage (and Cook's distance) for every sample assuming a linear model. We used an outlier test based on the Studentized residuals to order outliers by statistical significance (Bonferroni adjusted). We also tested for heteroskedasticity (Breusch-Pagan) and autocorrelation (Durbin-Watson) in our residuals. All tests were normal, and no actions were taken to remove any samples.
+
+__Multicollinearity__. We looked for multicollinearity using the variance inflation factor (VIF). The VIF measures how much the standard error of an estimated regression coefficient has increased because of collinearity, by taking the ratio of variance in a model with multiple terms divided by the variance of a model with one term alone. We removed features with $VIF \gt 10$ when fitting an ordinary linear regression model. For all other models, we did not manually remove any collinear features, and instead let their built-in feature selection routines decide how to handle correlations.
+
+### Diagnostic plots
+Below we show several diagnostic plots of the linear model, and measures for outliers and influential points. None of the figures indicate any remaining pathologies.
+
+```{r, echo = F, fig.height = 8, fig.width=10}
+load("pca_cor_clust.RData")
+par(mfrow=c(2,2))
+plot(full.vif$ols, which = c(1:3, 5))
+```
+
+
+# Overview
+
+## PCA
+
+Here we want to visualize the dataset by projecting it onto a lower dimensional space. We computed principal components to identify orthogonal axes of variation, and used muliple linear regression to identify PCs associated with the response variable. We then visualized the samples projected onto the plane formed by the two most significant PCs (*Fig. PCA*). A pattern is visually apparent, with the quartiles of the response variable spread along a slight diagonal in the plane. 
+
+The feature vectors most aligned with this diagonal are some of the most important features in the dataset, which we will see again as we move on to more sophisticated analysis. For now, we quantified their importance by simply computing the correlation between each feature and the response variable, the most significant of which we show in *Fig. $r$*. That these features are so easily spotted along the diagonal in the figures suggests that the geometry in *Fig. PCA* provides a fairly complete intuition about the dataset. For example, the diagonal nature of the associations indicates that a major axis of variation appears as a linear combination of other features, one of which correlates with the response variable while the other may not.
+
+
+```{r, message = F, echo = F, fig.width=10, fig.cap = "*__Figure - PCA__ We plotted samples projected onto the most significant principal components. Samples labeled by their `SUBID`, and colored by quartiles of the response variable. The standard error of each quartile is illustrated by a corresponding ellipse. The feature vectors are also shown projected onto the plane as arrows from the origin labeled with their feature name. *"}
+
+require(gridExtra)
+load("pca_cor_clust.RData")
+gg.biplot
+#grid.arrange(gg.biplot, gg.pcavarplot, nrow = 1, widths = c(5,5), heights = c(5))
+```
+
+
+```{r, echo = F, fig.width=10, , fig.height = 4, fig.cap = "*__Figure - r__ (**Left**) The top 40 feature vectors from the PCA biplot are redrawn so that the labels are readable, and colored by their contribution to the principal components. (**Right**) We tested the Pearson correlation of each feature with the response variable, and ranked those features that achieve a Family-Wide Error Rate (FWER) of 5% using Bonferroni's correction.*"}
+grid.arrange(gg.pcavarplot, gg.correlation, nrow = 1, widths = c(5,5))
+```
+
+
+
+## Clustering
+
+We double standardized the raw (before cleaning) data and used hierarchical clustering on the Euclidean distance to look for clusters (Figure - Clustering). We can clearly see the feature degeneracies as blocks of columns that look almost identical. The graph we used to identify strongly connected components among the degenerate features is shown in Figure-Degeneracies. Aside from the small groups of strongly correlated features, there were approximately 4 big clusters across the entire feature space. We also observed sample clusters that may be worth looking into -- we spot 2, maybe 3. Knowing what these groups are could possibly have a big impact on the accuracy of the predictive model, and differences between subgroups (like male/female, case/control) are often interesting for a number of other reasons.
+
+```{r,echo = F, message = F, fig.width = 10, fig.height = 7, fig.cap = "*__Figure - Clustering__: We double standardized the data and used hierarchical clustering on the Euclidean distance. Columns are features and rows are `SUBID`*."}
+require(pheatmap)
+gg.clustering
+
+```
+
+
+
+
+```{r, echo=F, message = F, fig.width = 10, fig.height = 7, fig.cap = "*__Figure - Degeneracies__: A graph where each node is a feature and each edge is a correlation $r > 0.975$. Nodes that form strongly connected components are highly degenerate.*"}
+require(igraph)
+plot(full.vif$subgraph, main = "Approximately degenerate features", axes = F, edge.width = 5, edge.color = "darkgrey")
+```
+
+
+# Evaluation
+
+## Candidate models
+
+Our next step is to consider a set of candidate models, and evaluate them on the basis of their prediction error (RMSE) on an independent holdout set. We partitioned the dataset into 80% training data and 20% holdout testing data. The partitioning was done by discretizing the response variable into 5 quantiles, and subsampling from each quantile separately. On this training set, we fit the following models:
+
+- __lm.vif__: linear regression model with features removed according to VIF
+- __pls__: partial least squares regression
+<!-- - __bayesglm__: Bayesian linear regression (conceptually related to ridge regression) -->
+- __glmnet__: elastic net (L1 + L2) regularization
+- __ridge__: L2 regularization
+- __BstLm__: boosted linear regression
+- __pcr__: principal component regression
+- __icr__: independent component regression
+- __gbm__: gradient boosting machine
+<!-- - __nnet__: neural network -->
+
+
+## Tuning the models
+
+Each model has a number of hyperparameters, specifying things like the number of principal components to keep, or the penalty strength of some regularization method. We tuned each hyperparameter over a 20-point grid for each model, where the best hyperparameters correspond to the grid point that minimizes the root mean squared error (RMSE) in a 10-fold 2x-repeated cross validation sheme. We show the tuning curves for each model below. 
+
+```{r, echo =F, fig.height = 4, fig.cap = "*__Figure - Tuning__: The tuning of models over a grid of hyperparameters, where the optimal hyperparameter minimizes the RMSE.*"}
+rm(list = setdiff(ls(), lsf.str()))
+load("validation_models.RData")
+
+par(mfrow=c(4,2))
+plot(model.cv$pls$model, main = "Partial least squares regression")
+plot(model.cv$glmnet$model, main = "Elastic net regression", nameInStrip = T)
+plot(model.cv$ridge$model, main = "Ridge regression", xTrans = log, digits = 2, ylim = c(9,17), xlab = "log weight decay")
+plot(model.cv$BstLm$model, main = "Boosted regression")
+plot(model.cv$pcr$model, main = "Principal component regression")
+plot(model.cv$icr$model, main = "Independent component regression")
+plot(model.cv$gbm$model, main = "Gradient boosting machine")
+```
+
+
+<!-- As an example, we show the tuning of the [`glmnet` elastic net](https://web.stanford.edu/~hastie/glmnet/glmnet_alpha.html#lin) in *Fig.-Tuning*. Here, the "mixing percentage" measures the parameter $\alpha$, which mixes between the L1-penalty LASSO ($\alpha=1$) and the L2-penalty Ridge regression ($\alpha=0$). The "Regularization Parameter" measures the parameter $\lambda$, which is the strength of the penalty specified by $\alpha$. -->
+
+<!-- ```{r, echo =F, fig.cap = "*__Figure - Tuning__: The tuning of the `glmnet` elastic net was done over a 2-d parameter grid, where the best point defines the optimal parameter choice.*"} -->
+<!-- rm(list = setdiff(ls(), lsf.str())) -->
+<!-- load("evaluation_models.RData") -->
+
+<!-- plot(model.cv$glmnet$model, main = "glmnet elastic net") -->
+
+<!-- ``` -->
+
+
+### Computing time
+
+Each model takes a different amount of time to train, with more complex models requiring more time. We, of course, prefer faster algorithms. However, none of these are prohibitively slow.
+
+```{r, echo =F, message = F}
+require(kableExtra)
+kable(rValues$timings[order(rValues$timings$Everything),1:2],
+      digits = 3,
+      row.names = T,
+      caption = "Table - Computing time (seconds).") %>%
+    kable_styling(bootstrap_options = c("striped", 
+                                        "hover", 
+                                        "condensed",
+                                        "responsive"),
+                  font_size = 14) %>%
+    scroll_box(width = "100%") 
+```
+
+
+
+## Prediction errors
+
+
+### RMSE of prediction
+
+We tested each model on the holdout set recorded the RMSE (*Table - RMSE*). This technique is the gold standard for measuring the model's true prediction error (if the dataset is large enough -- ours probably isn't). As defined, the model's true prediction error is how well the model will predict for new data, and by holding out a test data set from we can directly measure this. We noticed that the error in the testing set is larger than the error in the training set -- which is entirely expected. The increase in the error tells us how poorly the model generalizes to new data. 
+
+The cost of the holdout method comes in the amount of data that is removed from the model training process, in this case 20%. This means that our model is trained on a smaller data set and its error is likely to be higher than if we trained it on the full data set. The standard procedure in this case is to report your error using the holdout set, and then train a final model using all your data, which we do in this analysis. But the reported error is likely to be conservative in this case, with the true error of the full model actually being lower. 
+
+There are additional limitations to the holdout method. We're also interested in the variability of estimates across models, but it's hard to tell whether the variability in the RMSE is large just by looking at these numbers. It's also hard to know whether the RMSE estimates are accurate, or whether they are a result of the particular split we did on the data -- especially since our dataset does not have that many samples.  In the next section, we answer these questions by looking at the distribution of RMSE estimates computed from each fold in the cross validation. 
+
+```{r, echo=F, message=F}
+require(kableExtra)
+
+# kable(RMSE_summary.sorted,
+#       digits = 3,
+#       row.names = T,
+#       caption = "Table - RMSE: for training and testing sets.") %>%
+#     kable_styling(bootstrap_options = c("striped", 
+#                                         "hover", 
+#                                         "condensed",
+#                                         "responsive"),
+#                   font_size = 14) %>%
+#     scroll_box(width = "50%") 
+
+kable(RMSEMAE_summary.sorted,
+      digits = 3,
+      row.names = T,
+      caption = "Table - RMSE, MAE, Rsquare for training and testing sets.") %>%
+    kable_styling(bootstrap_options = c("striped", 
+                                        "hover", 
+                                        "condensed",
+                                        "responsive"),
+                  font_size = 14) %>%
+    scroll_box(width = "100%") 
+```
+
+<!-- ### RMSE comparisons -->
+
+
+<!-- ```{r, echo=F, message = F, warning = F, fig.cap = "*__Figure - ANOVA__: The absolute error of every prediction is shown for every model. The significance is evaluated using a mixed-effect model with a random intercept for `SUBID`, and we connect each unique `SUBID` across all the models in the figure with line segments. The significance of comparisons to the leader are shown as Bonferroni corrected $p$-values.*"} -->
+<!-- require(ggplot2) -->
+<!-- plot(ggplot_gtable(absolute_error.plot)) -->
+<!-- ``` -->
+
+### CV estimates of errors
+
+```{r, echo=F}
+rtest <- cor.test(RMSE_summary$`training RMSE`, RMSE_summary$`testing RMSE`, method = "p")
+ttest <- t.test(RMSE_summary$`training RMSE`, RMSE_summary$`testing RMSE`, paired = T)
+
+d <- signif(ttest$estimate, 2)
+ci <- signif(ttest$conf.int, 2)
+```
+
+During each round of cross-validation, we computed out-of-sample estimates of the RMSE. The mean of these estimates is supposed to provide a near-unbiased estimate of the prediction RMSE, and we see that they are somewhat consistent with the values in *Table - RMSE*, only smaller. This difference might indicate that the estimate was sensitive to the particular holdout we used, and fluctuated upward. 
+
+This method is advantageous because it provides us with a way to estimate the variability of the RMSE, since we can see how much they change under random perturbations of the training data. This variance is overly large, however, and if we were interested in estimating a proper confidence interval for the prediction RMSE, bootstrap methods would be more appropriate than cross validation. However, the bootstrap methods provide more pessimistic, biased estimates of the prediction RMSE -- indicative of the usual tradeoff between bias and variance. One important question of cross-validation is what number of folds to use. The smaller the number of folds, the more biased the error estimates (they will be biased to be conservative indicating higher error than there is in reality) but the less variable they will be ([citation](http://scott.fortmann-roe.com/docs/MeasuringError.html)).
+
+We noticed some important differences in this model ranking compared to the one based on the holdout set. Here, ordinary linear regression with VIF filtering performed worst, and the gradient boosting machine (gbm) performed best -- both of which are expected results. We expected that the VIF filtered model should demonstrate the worst performance, because the feature selection process was the most clunky, in essence over-regularizing and thus under-fitting. We also expected that the gradient boosting machine shows the least error, since it is the one model we included capable of fitting non-linear complexities. The `gbm` is well known to outperform in many situations, frequently at the heart of winning Kaggle competitions, alongside the `xgboost` variant (which has even more hyperparameters).
+
+
+```{r, echo=F, message = F, fig.cap = "*__Figure - TrainCV__: MAE, RMSE, and Rsquared estimates obtained for each of the folds/repeats during cross-validation.*"}
+gg.cv
+```
+
+
+Here we show summary statistics of the RMSE and MAE distributions across cross-validation folds for each model. These numbers exactly correspond to the boxplot features above.
+
+
+```{r, echo = F}
+
+temp <- summary(rValues)
+# temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),]
+# temp$statistics$MAE[order(temp$statistics$MAE[,4]),]
+
+# kable(RMSE.df[order(RMSE.df$RMSE), ],
+#       digits = 3,
+#       row.names = F,
+#       caption = "Table - RMSE estimate from cross-validation.") %>%
+#     kable_styling(bootstrap_options = c("striped",
+#                                         "hover",
+#                                         "condensed",
+#                                         "responsive"),
+#                   font_size = 14) %>%
+#     scroll_box(width = "50%")
+
+kable(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),],
+      digits = 3,
+      row.names = T,
+      caption = "Table - RMSE estimates from cross-validation.") %>%
+    kable_styling(bootstrap_options = c("striped",
+                                        "hover",
+                                        "condensed",
+                                        "responsive"),
+                  font_size = 14) %>%
+    scroll_box(width = "100%")
+
+
+kable(temp$statistics$MAE[order(temp$statistics$MAE[,4]),],
+      digits = 3,
+      row.names = T,
+      caption = "Table - MAE estimates from cross-validation.") %>%
+    kable_styling(bootstrap_options = c("striped",
+                                        "hover",
+                                        "condensed",
+                                        "responsive"),
+                  font_size = 14) %>%
+    scroll_box(width = "100%")
+```
+
+
+
+
+### Bias and variance in prediction
+
+We compared the predicted values to the true values for the testing data, and inspected the residuals for the training data. In both, we recognized a particular bias: the low values of the response variable are consistently overestimated, and the high values are consistently underestimated. This bias is an expected result, caused by shrinkage of regression coefficients due to the regularization -- whether it's the L1 or L2 penalty, or something else. It's presence reflects the fact that the model is underfitting in order to minimize the RMSE, and more data is required to increase model complexity.
+
+This illustrates a well-known tradeoff between bias and variance in the model fit and prediction. Typical discussions bring up the ideas of asymptotic consistency and asymptotic efficiency, which imply that as the training sample size grows towards infinity, the model's bias will fall to 0 (asymptotic consistency) and the model will have a variance that is no worse than any other potential model you could have used (asymptotic efficiency). However, non-asymptotic behavior is much more complicated, and an algorithm that has close to no bias when trained on a million points may have very significant bias when trained on only a hundred data points ([citation](http://scott.fortmann-roe.com/docs/BiasVariance.html)). 
+
+
+
+```{r, echo=F, message = F, fig.width = 10, fig.cap = "*__Figure - Validation__: We show the true value of the response variable on the x-axis, and the predicted value on the y-axis. (__Top__) The fit on the training set after regularization using cross-validation. (__Bottom__) The predictions of the trained model on the holdout testing set.*"}
+gg.error
+```
+
+
+
+
+
+# Final Model
+
+
+
+```{r, echo = F, message = F}
+rm(list = setdiff(ls(), lsf.str()))
+load("final_models.RData")
+
+RMSE <- as.data.frame(sort(training.final.RMSE))
+colnames(RMSE) <- "training RMSE"
+
+# kable(RMSE,
+#       digits = 3,
+#       row.names = T,
+#       caption = "Table - RMSE: for whole-data training set.") %>%
+#     kable_styling(bootstrap_options = c("striped", 
+#                                         "hover", 
+#                                         "condensed",
+#                                         "responsive"),
+#                   font_size = 14) %>%
+#     scroll_box(width = "50%") 
+```
+
+## CV estimates of RMSE
+
+We fit the same array of candidate models again, this time on the whole dataset. We used the same hyperparameter tuning procedure, minimizing RMSE using 10-fold 2x repeated cross validation. Again, during each round of cross-validation, we computed out-of-sample estimates of the RMSE and MAE. These estimates provide a near-unbiased estimate of the prediction RMSE and MAE, and also give us an impression of the uncertainty. 
+
+We again noticed that the ordinary linear regression with VIF filtering performed worse than the others. We also again noticed that the gradient boosting machine (gbm) performed best, which is expected. However, aside from those two, the remaining models look essentially equivalent in terms of error.
+
+
+```{r, echo=F, message = F, warning = F, fig.cap = "*__Figure - FinalCV__: We computed estimates of MAE, RMSE, and Rsquared for each fold/repeat during cross-validation on the full dataset.*"}
+gg.final.cv
+```
+
+Here we show summary statistics characterizing the distribution of RMSE and MAE estimates for each model across cross-validation folds. The variability of these estimates is larger than the true standard error would be, which could be better estimated using the boostrap. 
+
+```{r, echo = F}
+
+# kable(RMSE.df[order(RMSE.df$RMSE), ],
+#       digits = 3,
+#       row.names = F,
+#       caption = "Table - RMSE: for whole-data training set.") %>%
+#     kable_styling(bootstrap_options = c("striped",
+#                                         "hover",
+#                                         "condensed",
+#                                         "responsive"),
+#                   font_size = 14) %>%
+#     scroll_box(width = "50%")
+
+temp <- summary(rValues)
+# temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),]
+# temp$statistics$MAE[order(temp$statistics$MAE[,4]),]
+
+kable(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),],
+      digits = 3,
+      row.names = T,
+      caption = "Table - RMSE estimates from cross-validation.") %>%
+    kable_styling(bootstrap_options = c("striped",
+                                        "hover",
+                                        "condensed",
+                                        "responsive"),
+                  font_size = 14) %>%
+    scroll_box(width = "100%")
+
+
+kable(temp$statistics$MAE[order(temp$statistics$MAE[,4]),],
+      digits = 3,
+      row.names = T,
+      caption = "Table - MAE estimates from cross-validation.") %>%
+    kable_styling(bootstrap_options = c("striped",
+                                        "hover",
+                                        "condensed",
+                                        "responsive"),
+                  font_size = 14) %>%
+    scroll_box(width = "100%")
+```
+
+
+
+<!-- ## Bias from regularization -->
+
+<!-- We recognized the same bias as before in the full fit. -->
+
+<!-- ```{r, echo=F, message = F, warning = F, fig.height=3, fig.cap="*__Figure - Final Fit__: We show the errors in fitting on the training data following regularization using cross-validation.*"} -->
+<!-- gg.final.error -->
+<!-- ``` -->
+
+## Feature selection
+
+In the beginning of this analysis, we looked at features by computing their correlation with the response variable. This is a fairly common and intuitive filtering method used to select features for a reduced model. Many other types of feature selection are also readily available in R, where the `caret` package implements wrappers for recursive feature elimination, genetic algorithms, and simulated annealing. Additionally, many of the regression algorithms are understood to be doing their own form of feature selection.
+
+Of the algorithms we have been fitting, `glmnet`, `pls`, `gbm`, and `lm` have their own built-in feature selection routines; the remaining methods default to the simple correlation method, so we removed all but `pcr` since they provided identical results. We summarized the different feature selection results by showing their *variance importance scores* (*Figure-Variable Importance*). In linear regression, variable importance is generally measured by the squared coefficient. We found that each model has a slightly different regularization or way of shrinking the coefficients, leading to different features being selected.
+
+```{r, echo=F, message = F, fig.width=11, fig.height=4, fig.cap = "*__Figure - Variable Importance__: We show a heatmap of the variable importance scores produced by each competing model. All scores are scaled to the range [0,100]. `glmnet`, `pls`, `gbm`, and `lm` have their own built-in feature selection routines related to the model coefficients; the remaining methods default to the simple correlation method.*"}
+gg.vip.transpose
+```
+
+
+
+
+# Conclusions
+
+In this analysis, we built a predictive model for a high-dimensional dataset where the number of samples is approximately equal to the number of predictors, $n\sim p$. We discussed the process of feature selection, model creation, and assessing overall confidence in the model. 
+
+We determined that the models iare underfitting and could benefit from more data. This appears as bias in the predictions, due to shrinkage of the coefficients, such that low values are over-estimated and high values are under-estimated. By increasing the size of the dataset, the model may be able to take on more complexity under cross-validation.
+
+For the current setup, we estimated that `r rownames(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),])[1]` is the best model, with an estimated `r paste0("RMSE = ", signif(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),][1,4], 3), " (IQR: ",  signif(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),][1,2], 3), " - ", signif(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),][1,5], 3), ")" )`. The worst model was `r rownames(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),])[nrow(temp$statistics$RMSE)]`, with an estimated `r paste0("RMSE = ", signif(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),][nrow(temp$statistics$RMSE),4], 3), " (IQR: ",  signif(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),][nrow(temp$statistics$RMSE),2], 3), " - ", signif(temp$statistics$RMSE[order(temp$statistics$RMSE[,4]),][nrow(temp$statistics$RMSE),5], 3), ")" )`. The remaining methods look approximately equivalent in error, but there were large differences in computational cost. If speed is an important consideration, partial least squares (`pls`) and principal component regression (`pcr`) performed quite well and are blazing fast. If built-in feature selection is also an important consideration, then `pls` stands alone in its ability to calculate interpretable and accurate results very quickly. 
+
+
+
